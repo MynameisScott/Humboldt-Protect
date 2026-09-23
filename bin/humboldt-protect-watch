@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+import collections
+import datetime
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import threading
+import time
+
+CONFIG = Path('/etc/humboldt-protect/config.json')
+HELPER = '/usr/local/sbin/humboldt-protect-contain'
+HUMBOLDT_CLI = '/usr/local/sbin/humboldt-protect'
+DASH_NOTIFY = '/usr/local/sbin/humboldt-dash-notify'
+SCHEDULER_STATE_DIR = Path('/var/lib/humboldt-protect')
+SCHEDULER_STATE = SCHEDULER_STATE_DIR / 'scheduler-state.json'
+
+WRITE_OPS = {'write', 'pwrite', 'pwrite_send', 'pwrite_recv', 'offload_write_send', 'offload_write_recv'}
+RENDEL_OPS = {'rename', 'renameat', 'unlink', 'unlinkat'}
+FILE_OPS = WRITE_OPS | RENDEL_OPS | {'create_file', 'openat'}
+
+activity = collections.defaultdict(collections.deque)
+last_action = {}
+_scheduler_busy = False
+_scheduler_busy_lock = threading.Lock()
+
+
+def load_config():
+    return json.loads(CONFIG.read_text())
+
+
+CFG = load_config()
+DETECT = CFG.get('detector', {})
+WINDOW = int(DETECT.get('window_seconds', 5))
+MIN_FILES = int(DETECT.get('min_files', 5))
+MIN_WRITES = int(DETECT.get('min_writes', 3))
+MIN_RENDEL = int(DETECT.get('min_rename_delete', 3))
+COOLDOWN = int(DETECT.get('cooldown_seconds', 300))
+
+
+def real_file(path):
+    if not path:
+        return False
+    base = os.path.basename(path)
+    if not base or base.startswith('~$') or base.lower().endswith('.tmp'):
+        return False
+    if path.endswith('/'):
+        return False
+    return True
+
+
+def parse_audit_line(line):
+    # Formato preferido do full_audit: %u|%I|%S seguido de operacao|resultado|path.
+    parts = [p.strip() for p in line.split('|')]
+    if len(parts) >= 6:
+        user, ip, share, op = parts[0], parts[1], parts[2], parts[3].lower()
+        path = '|'.join(parts[5:]).strip()
+        try:
+            ipaddress.ip_address(ip)
+            return user, ip, share, op, path
+        except ValueError:
+            pass
+
+    # Fallback para logs no estilo key=value.
+    m = re.search(r'user=(\S+)\s+ip=(\S+)\s+share=(\S+)\s+op=(\S+)(?:\s+path=(.*))?', line)
+    if m:
+        return m.group(1), m.group(2), m.group(3), m.group(4).lower(), (m.group(5) or '').strip()
+    return None
+
+
+def counts_for(q, now):
+    while q and now - q[0][0] > WINDOW:
+        q.popleft()
+    files=set(); writes=0; rendel=0
+    for _, op, path in q:
+        if op in WRITE_OPS: writes += 1
+        if op in RENDEL_OPS: rendel += 1
+        if op in FILE_OPS and real_file(path): files.add(path)
+    return len(files), writes, rendel, len(q)
+
+
+def _dash_notify_worker(level, title, details, event_id):
+    try:
+        result=subprocess.run([
+            DASH_NOTIFY, '--level', level, '--source', 'Valdecir', '--title', title,
+            '--details', details, '--event-id', event_id,
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=8, check=False)
+        if result.returncode != 0:
+            output=(result.stdout or '').strip().replace('\n',' ')[:500]
+            subprocess.run(['logger','-p','local0.warning','-t','humboldt-protect',
+                            f'DASH NOTIFY FALHOU rc={result.returncode} event={event_id} output={output}'],check=False)
+    except Exception as exc:
+        subprocess.run(['logger','-p','local0.warning','-t','humboldt-protect',
+                        f'DASH NOTIFY ERROR event={event_id} erro={exc}'],check=False)
+
+
+def dash_notify(level, title, details, event_id):
+    try:
+        threading.Thread(target=_dash_notify_worker,args=(level,title,details,event_id),daemon=True,name='humboldt-dash-notify').start()
+    except Exception as exc:
+        subprocess.run(['logger','-p','local0.warning','-t','humboldt-protect',
+                        f'DASH NOTIFY THREAD ERROR event={event_id} erro={exc}'],check=False)
+
+
+def contain(user, ip, share, unique_files, writes, rendel, total):
+    now_wall=time.time()
+    if now_wall - last_action.get((user,ip),0) < COOLDOWN:
+        return
+    last_action[(user,ip)] = now_wall
+    stamp=time.strftime('%Y-%m-%d %H:%M:%S')
+    print('\n############################################################')
+    print('#        ALERTA DE RANSOMWARE - CONTENCAO ATIVA            #')
+    print('############################################################\n')
+    print(f'Horario           : {stamp}')
+    print(f'Usuario           : {user}')
+    print(f'IP                : {ip}')
+    print(f'Compartilhamento  : {share}')
+    print(f'Arquivos distintos: {unique_files}')
+    print(f'Writes            : {writes}')
+    print(f'Rename/Delete     : {rendel}')
+    print(f'Eventos totais    : {total}\n')
+    subprocess.run(['logger','-p','local0.crit','-t','humboldt-protect',
+                    f'ALERTA user={user} ip={ip} share={share} files={unique_files} writes={writes} rendel={rendel} total={total}'],check=False)
+    print('Aplicando quarentena SMB temporaria...')
+    try:
+        helper_env=os.environ.copy()
+        containment_cfg=CFG.get('containment', {})
+        helper_env['HUMBOLDT_CLIENT_NETWORK']=str(containment_cfg.get('client_network','192.168.150.0/24'))
+        helper_env['HUMBOLDT_SERVER_IP']=str(containment_cfg.get('server_ip','192.168.150.9'))
+        helper_env['HUMBOLDT_BLOCK_TIMEOUT']=str(containment_cfg.get('block_timeout','5m'))
+        result=subprocess.run([HELPER,user,ip],capture_output=True,text=True,timeout=10,env=helper_env)
+        print(f'Helper exit code  : {result.returncode}')
+        if result.stdout.strip(): print(result.stdout.strip())
+        if result.stderr.strip(): print(result.stderr.strip())
+        if result.returncode == 0:
+            print('CONTENCAO: APLICADA')
+            dash_notify('red','Ransomware detectado - contencao aplicada',
+                        f'Usuario: {user} | IP: {ip} | Share: {share} | Arquivos: {unique_files} | Writes: {writes} | Rename/Delete: {rendel} | Eventos: {total} | Bloqueio SMB temporario aplicado.',
+                        f'ransomware-{ip}-{int(now_wall)}')
+        else:
+            print('CONTENCAO: FALHOU')
+            dash_notify('red','Ransomware detectado - FALHA NA CONTENCAO',
+                        f'Usuario: {user} | IP: {ip} | Share: {share} | Arquivos: {unique_files} | Writes: {writes} | Rename/Delete: {rendel} | Eventos: {total} | Helper retornou rc={result.returncode}.',
+                        f'ransomware-contencao-falhou-{ip}-{int(now_wall)}')
+    except subprocess.TimeoutExpired:
+        print('CONTENCAO: TIMEOUT DO HELPER')
+        subprocess.run(['logger','-p','local0.err','-t','humboldt-protect',f'CONTENCAO TIMEOUT user={user} ip={ip} share={share}'],check=False)
+        dash_notify('red','Ransomware detectado - TIMEOUT NA CONTENCAO',
+                    f'Usuario: {user} | IP: {ip} | Share: {share} | Arquivos: {unique_files} | Writes: {writes} | Rename/Delete: {rendel} | Eventos: {total} | O helper de contencao excedeu o tempo limite.',
+                    f'ransomware-contencao-timeout-{ip}-{int(now_wall)}')
+    print()
+
+
+def load_scheduler_state():
+    if not SCHEDULER_STATE.exists(): return {'tasks':{}}
+    data=json.loads(SCHEDULER_STATE.read_text())
+    if not isinstance(data,dict) or not isinstance(data.get('tasks',{}),dict):
+        raise ValueError('estado do scheduler invalido')
+    return data
+
+
+def save_scheduler_state(state):
+    SCHEDULER_STATE_DIR.mkdir(parents=True,exist_ok=True)
+    tmp=SCHEDULER_STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n')
+    os.replace(tmp,SCHEDULER_STATE)
+
+
+def scheduler_backup_worker(task, command, due_key):
+    global _scheduler_busy
+    try:
+        now=datetime.datetime.now().astimezone(); state=load_scheduler_state(); tasks=state.setdefault('tasks',{}); t=tasks.setdefault(task,{})
+        t['last_attempt_due']=due_key; t['last_attempt_at']=now.isoformat(timespec='seconds'); save_scheduler_state(state)
+        print(f'SCHEDULER | iniciando {task} | due={due_key}',flush=True)
+        proc=subprocess.Popen([HUMBOLDT_CLI,command],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+        if proc.stdout is not None:
+            for line in proc.stdout: print(f'BACKUP[{task}] | {line.rstrip()}',flush=True)
+        rc=proc.wait(); finished=datetime.datetime.now().astimezone(); state=load_scheduler_state(); tasks=state.setdefault('tasks',{}); t=tasks.setdefault(task,{})
+        t['last_rc']=rc; t['last_finished_at']=finished.isoformat(timespec='seconds')
+        if rc == 0:
+            t['last_success_due']=due_key; t['last_success_at']=finished.isoformat(timespec='seconds')
+            print(f'SCHEDULER | {task} concluido com sucesso',flush=True)
+            dash_notify('gray',f'Backup {task} concluido',f'Backup agendado concluido com sucesso. Task: {task} | Due: {due_key} | Finalizado: {finished.isoformat(timespec="seconds")}',f'backup-{task}-{due_key}-ok')
+        else:
+            print(f'SCHEDULER | {task} FALHOU | rc={rc}',flush=True)
+            dash_notify('red',f'Falha no backup {task}',f'O backup agendado falhou. Task: {task} | Due: {due_key} | rc={rc}',f'backup-{task}-{due_key}-falhou')
+        save_scheduler_state(state)
+    except Exception as exc:
+        print(f'SCHEDULER ERROR | task={task} | {exc}',flush=True)
+        dash_notify('red',f'Erro no scheduler de backup {task}',f'O scheduler encontrou uma excecao. Task: {task} | Due: {due_key} | Erro: {exc}',f'backup-{task}-{due_key}-scheduler-error')
+    finally:
+        with _scheduler_busy_lock: _scheduler_busy=False
+
+
+def launch_scheduler_backup(task, command, due_key):
+    global _scheduler_busy
+    with _scheduler_busy_lock:
+        if _scheduler_busy: return False
+        _scheduler_busy=True
+    try:
+        threading.Thread(target=scheduler_backup_worker,args=(task,command,due_key),daemon=True,name=f'humboldt-backup-{task}').start()
+        return True
+    except Exception:
+        with _scheduler_busy_lock: _scheduler_busy=False
+        raise
+
+
+def parse_hhmm(value):
+    h,m=value.split(':',1); return int(h),int(m)
+
+
+def scheduler_loop():
+    sched=CFG.get('scheduler',{}); files_time=sched.get('files_time','23:00'); server_time=sched.get('server_time','02:00')
+    catchup=datetime.timedelta(hours=float(sched.get('catchup_hours',6)))
+    retry_seconds=max(60,int(sched.get('retry_minutes',15))*60)
+    jobs=[('files','backup-now',files_time),('server','server-backup-now',server_time)]
+    last_error=None
+    while True:
+        try:
+            now=datetime.datetime.now().astimezone(); state=load_scheduler_state(); tasks=state.setdefault('tasks',{})
+            for task,command,hhmm in jobs:
+                if task=='server' and not CFG.get('server_backup',False): continue
+                h,m=parse_hhmm(hhmm); due=now.replace(hour=h,minute=m,second=0,microsecond=0)
+                if now < due: due -= datetime.timedelta(days=1)
+                age=now-due
+                if age < datetime.timedelta(0) or age > catchup: continue
+                due_key=due.isoformat(timespec='minutes')
+                t=tasks.setdefault(task,{})
+                if t.get('last_success_due')==due_key: continue
+                last_attempt=t.get('last_attempt_at')
+                if last_attempt:
+                    try:
+                        if (now-datetime.datetime.fromisoformat(last_attempt)).total_seconds() < retry_seconds: continue
+                    except Exception: pass
+                if launch_scheduler_backup(task,command,due_key): break
+            last_error=None
+        except Exception as exc:
+            message=str(exc)
+            if message != last_error: print(f'SCHEDULER ERROR | {message}',flush=True); last_error=message
+        time.sleep(30)
+
+
+def start_scheduler():
+    threading.Thread(target=scheduler_loop,daemon=True,name='humboldt-scheduler').start()
+
+
+def main():
+    protected={name for name,data in CFG.get('shares',{}).items() if data.get('protect',False)}
+    print('='*60); print(' HUMBOLDT PROTECT - SMB RANSOMWARE PROTECTION'); print('='*60)
+    print(f'Janela             : {WINDOW}s')
+    print(f'Arquivos distintos : >= {MIN_FILES}')
+    print(f'Writes             : >= {MIN_WRITES}')
+    print(f'Rename/Delete      : >= {MIN_RENDEL}')
+    print('Diretorios nao entram na contagem de arquivos.')
+    print('Temporarios ~$ e *.tmp sao ignorados.')
+    print('CONTENCAO AUTOMATICA SMB: ATIVA')
+    print('Ctrl+C para parar.')
+    print('CONFIG | protect ON: ' + ', '.join(sorted(protected)))
+    sched=CFG.get('scheduler',{})
+    print(f"SCHEDULER | ativo | files={sched.get('files_time','23:00')} | server={sched.get('server_time','02:00')} | catchup={sched.get('catchup_hours',6)}h | retry={sched.get('retry_minutes',15)}m",flush=True)
+    start_scheduler()
+    proc=subprocess.Popen(['journalctl','-f','-n','0','-o','cat'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        parsed=parse_audit_line(raw.strip())
+        if not parsed: continue
+        user,ip,share,op,path=parsed
+        if share not in protected: continue
+        if op not in FILE_OPS: continue
+        now=time.monotonic(); key=(user,ip,share); q=activity[key]; q.append((now,op,path))
+        unique_files,writes,rendel,total=counts_for(q,now)
+        # Regra conservadora: volume de arquivos + sinais de escrita e rename/delete na mesma janela.
+        if unique_files >= MIN_FILES and writes >= MIN_WRITES and rendel >= MIN_RENDEL:
+            contain(user,ip,share,unique_files,writes,rendel,total)
+            q.clear()
+
+if __name__=='__main__': main()

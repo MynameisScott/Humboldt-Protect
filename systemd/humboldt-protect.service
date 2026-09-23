@@ -1,0 +1,18 @@
+[Unit]
+Description=Humboldt Protect - SMB Ransomware Protection
+After=network-online.target ufw.service smbd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/humboldt-protect-nft-init
+ExecStart=/usr/bin/python3 -u /usr/local/sbin/humboldt-protect-watch
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

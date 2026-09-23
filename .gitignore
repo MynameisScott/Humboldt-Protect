@@ -1,0 +1,18 @@
+# Segredos e estado local
+.env
+*.env
+!*.env.example
+config.json
+*.passphrase
+*.key
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+
+# Sistema/editor
+.DS_Store
+*.swp

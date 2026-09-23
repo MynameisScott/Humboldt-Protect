@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+CONFIG = Path('/etc/humboldt-protect/config.json')
+BACKUP_LOCK = '/run/humboldt-protect-backup.lock'
+
+
+def fail(message, rc=1):
+    print(f'ERRO: {message}', file=sys.stderr)
+    raise SystemExit(rc)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        fail('execute como root (sudo).', 2)
+
+
+def load_config():
+    if not CONFIG.exists():
+        fail(f'configuracao nao encontrada: {CONFIG}', 2)
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except Exception as exc:
+        fail(f'configuracao invalida: {exc}', 2)
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.config.', dir=str(CONFIG.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+            f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CONFIG)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def bool_text(value):
+    return 'ON' if value else 'OFF'
+
+
+def borg_env(cfg):
+    env = os.environ.copy()
+    passfile = cfg.get('borg', {}).get('passphrase_file')
+    if passfile:
+        p = Path(passfile)
+        if not p.exists():
+            fail(f'arquivo de passphrase nao encontrado: {p}', 2)
+        env['BORG_PASSCOMMAND'] = f'cat {p}'
+    return env
+
+
+def borg_repo(cfg, which):
+    key = 'files_repo' if which == 'files' else 'server_repo'
+    repo = cfg.get('borg', {}).get(key)
+    if not repo:
+        fail(f'repositorio Borg nao configurado: {key}', 2)
+    return repo
+
+
+def retention_args(cfg):
+    borg = cfg.get('borg', {})
+    args = []
+    for key, opt in [('keep_daily','--keep-daily'), ('keep_weekly','--keep-weekly'), ('keep_monthly','--keep-monthly')]:
+        value = borg.get(key)
+        if value is not None:
+            args += [opt, str(value)]
+    return args
+
+
+def cmd_list(cfg):
+    print(f"{'SHARE':<18} {'PROTECT':<10} {'BACKUP':<10} PATH")
+    print('-' * 90)
+    for name, data in cfg.get('shares', {}).items():
+        print(f"{name:<18} {bool_text(data.get('protect', False)):<10} {bool_text(data.get('backup', False)):<10} {data.get('path','')}")
+    print()
+    print(f"{'SERVER':<18} {'-':<10} {bool_text(cfg.get('server_backup', False)):<10} {cfg.get('backup_root','')}/SERVER")
+
+
+def set_share(cfg, share, field, value):
+    shares = cfg.get('shares', {})
+    if share not in shares:
+        fail(f'share desconhecido: {share}', 2)
+    shares[share][field] = value == 'on'
+    save_config(cfg)
+    print(f'{field} {share}: {value.upper()}')
+
+
+def cmd_server_backup(cfg, value):
+    cfg['server_backup'] = value == 'on'
+    save_config(cfg)
+    print(f'server-backup: {value.upper()}')
+
+
+def selected_backup_shares(cfg):
+    selected=[]
+    for name,data in cfg.get('shares', {}).items():
+        if data.get('backup', False):
+            path = data.get('path')
+            if path:
+                selected.append((name, path))
+    return selected
+
+
+def run_with_backup_lock(label, func, cfg):
+    fd = os.open(BACKUP_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail('ja existe outro backup Humboldt Protect em execucao', 3)
+        os.ftruncate(fd,0); os.write(fd, label.encode())
+        return func(cfg)
+    finally:
+        os.close(fd)
+
+
+def ensure_borg_repo(repo, env):
+    probe = subprocess.run(['borg','info',repo], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    if probe.returncode == 0:
+        return
+    Path(repo).parent.mkdir(parents=True, exist_ok=True)
+    rc = subprocess.call(['borg','init','--encryption=repokey-blake2',repo], env=env)
+    if rc != 0:
+        fail(f'nao foi possivel inicializar o repositorio Borg: {repo}', rc)
+
+
+def prune_repo(cfg, repo, prefix, env):
+    cmd = ['borg','prune','--list',repo,'--glob-archives',f'{prefix}-*'] + retention_args(cfg)
+    rc = subprocess.call(cmd, env=env)
+    if rc != 0:
+        fail(f'borg prune terminou com codigo {rc}.', rc)
+    rc = subprocess.call(['borg','compact',repo], env=env)
+    if rc != 0:
+        fail(f'borg compact terminou com codigo {rc}.', rc)
+
+
+def cmd_backup_plan(cfg):
+    selected = selected_backup_shares(cfg)
+    print('=== BACKUP DE ARQUIVOS ===')
+    print('Repositorio:', borg_repo(cfg,'files'))
+    print('Selecionados:')
+    for name,path in selected:
+        print(f'  - {name}: {path}')
+    if not selected:
+        print('  (nenhum)')
+    print('Retencao:', ' '.join(retention_args(cfg)) or '(nao definida)')
+
+
+def cmd_backup_now(cfg):
+    selected = selected_backup_shares(cfg)
+    if not selected:
+        fail('nenhuma share habilitada para backup.', 2)
+    for name,path in selected:
+        if not os.path.isdir(path):
+            fail(f'path da share {name} nao existe: {path}', 2)
+    repo = borg_repo(cfg,'files'); env=borg_env(cfg); ensure_borg_repo(repo, env)
+    stamp=datetime.datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S')
+    archive=f'files-{stamp}'
+    compression=cfg.get('borg',{}).get('compression','zstd,6')
+    cmd=['borg','create','--stats','--show-rc','--compression',compression,f'{repo}::{archive}']+[p for _,p in selected]
+    print('Criando:', archive)
+    rc=subprocess.call(cmd,env=env)
+    if rc != 0: fail(f'borg create terminou com codigo {rc}.', rc)
+    prune_repo(cfg, repo, 'files', env)
+    print('\nBACKUP DE ARQUIVOS: OK')
+
+
+def collect_server_metadata(root):
+    root.mkdir(parents=True, exist_ok=True)
+    commands={
+        'dpkg-list.txt':['dpkg-query','-W'],
+        'mounts.txt':['findmnt'],
+        'ip-address.txt':['ip','-br','addr'],
+        'ip-route.txt':['ip','route'],
+        'systemd-failed.txt':['systemctl','--failed','--no-pager'],
+        'virsh-list.txt':['virsh','list','--all'],
+    }
+    for name,cmd in commands.items():
+        try:
+            out=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30).stdout
+        except Exception as exc:
+            out=f'ERRO: {exc}\n'
+        (root/name).write_text(out or '', encoding='utf-8')
+
+
+def cmd_server_backup_plan(cfg):
+    print('=== BACKUP DO SERVIDOR ===')
+    print('Status:', bool_text(cfg.get('server_backup', False)))
+    print('Repositorio:', borg_repo(cfg,'server'))
+    print('Paths:')
+    for p in cfg.get('server_paths', []): print('  -',p)
+    print('Observacao: este pacote de referencia nao inclui imagens de VMs por padrao.')
+
+
+def cmd_server_backup_now(cfg):
+    if not cfg.get('server_backup', False):
+        fail('backup do servidor esta desativado.', 2)
+    repo=borg_repo(cfg,'server'); env=borg_env(cfg); ensure_borg_repo(repo,env)
+    metadata=Path(cfg.get('backup_root','/var/lib/humboldt-protect/server-metadata'))/'SERVER'
+    collect_server_metadata(metadata)
+    paths=[]
+    for p in cfg.get('server_paths', []):
+        if os.path.exists(p): paths.append(p)
+    if metadata.exists(): paths.append(str(metadata))
+    if not paths: fail('nenhum path valido para backup do servidor.',2)
+    stamp=datetime.datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S')
+    archive=f'server-{stamp}'
+    compression=cfg.get('borg',{}).get('compression','zstd,6')
+    rc=subprocess.call(['borg','create','--stats','--show-rc','--compression',compression,f'{repo}::{archive}']+paths,env=env)
+    if rc != 0: fail(f'backup do servidor terminou com codigo {rc}.',rc)
+    prune_repo(cfg,repo,'server',env)
+    print('\nBACKUP DO SERVIDOR: OK')
+
+
+def cmd_archives(cfg):
+    env=borg_env(cfg)
+    for title,which in [('ARQUIVOS','files'),('SERVIDOR','server')]:
+        print(); print(f'=== {title} ===')
+        repo=borg_repo(cfg,which)
+        subprocess.run(['borg','list','--short',repo],env=env)
+
+
+def cmd_archive_delete(cfg, which, archive):
+    if which not in ('files','server'): fail('repositorio invalido. Use files ou server.',2)
+    prefix='files-' if which=='files' else 'server-'
+    if not archive.startswith(prefix): fail(f'o archive informado nao corresponde ao repositorio {which}. Esperado prefixo {prefix}',2)
+    repo=borg_repo(cfg,which); env=borg_env(cfg)
+    result=subprocess.run(['borg','list','--short',repo],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+    if result.returncode != 0:
+        print(result.stderr.strip()); fail(f'nao foi possivel consultar o repositorio {which}.', result.returncode)
+    archives={x.strip() for x in result.stdout.splitlines() if x.strip()}
+    if archive not in archives: fail(f'archive nao encontrado no repositorio {which}: {archive}',2)
+    print('\n============================================================')
+    print(' EXCLUSAO MANUAL DE BACKUP BORG')
+    print('============================================================\n')
+    print(f'Repositorio : {which}\nArchive     : {archive}\nBorg repo   : {repo}\n')
+    print('ATENCAO:\nEste snapshot sera removido permanentemente.\nOs demais snapshots nao serao excluidos.\n')
+    try: confirmation=input(f"Digite exatamente '{archive}' para confirmar: ").strip()
+    except (EOFError,KeyboardInterrupt): print('\nOPERACAO CANCELADA.'); return
+    if confirmation != archive: print('\nOPERACAO CANCELADA: confirmacao nao confere.'); return
+    print('\nExcluindo archive...')
+    rc=subprocess.call(['borg','delete',f'{repo}::{archive}'],env=env)
+    if rc != 0: fail(f'borg delete terminou com codigo {rc}.',rc)
+    print('\nCompactando repositorio...')
+    rc=subprocess.call(['borg','compact',repo],env=env)
+    if rc != 0: fail(f'archive removido, mas borg compact terminou com codigo {rc}.',rc)
+    print(f'\nBACKUP EXCLUIDO COM SUCESSO\nRepositorio : {which}\nArchive     : {archive}')
+
+
+def systemctl_active(unit):
+    r=subprocess.run(['systemctl','is-active',unit],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+    return r.stdout.strip() or 'desconhecido'
+
+
+def cmd_check(cfg):
+    errors=0
+    print('=== CONFIGURACAO ===')
+    print('Arquivo :', CONFIG); print('Versao  :', cfg.get('version'))
+    print('\n=== BORG ===')
+    borg=shutil.which('borg')
+    if borg: subprocess.run([borg,'--version'])
+    else: print('ERRO: borg nao encontrado'); errors+=1
+    print('\n=== SERVICOS ===')
+    for unit in ['smbd.service','humboldt-protect.service']:
+        state=systemctl_active(unit); print(f'{unit}: {state}')
+        if unit=='humboldt-protect.service' and state!='active': errors+=1
+    print('\n=== PATHS ===')
+    for name,data in cfg.get('shares',{}).items():
+        p=data.get('path',''); ok=os.path.isdir(p); print(f'{name}: {p} -> {"OK" if ok else "AUSENTE"}')
+        if (data.get('protect') or data.get('backup')) and not ok: errors+=1
+    print('\n=== REPOSITORIOS ===')
+    env=borg_env(cfg)
+    for which in ('files','server'):
+        repo=borg_repo(cfg,which)
+        rc=subprocess.run(['borg','info',repo],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env).returncode if borg else 1
+        print(f'{which}: {repo} -> {"OK" if rc==0 else "ERRO"}')
+        if rc!=0: errors+=1
+    if errors: fail(f'check encontrou {errors} problema(s).',1)
+    print('\nCHECK: OK')
+
+
+def cmd_config(cfg): print(json.dumps(cfg,ensure_ascii=False,indent=2))
+
+
+def main():
+    require_root()
+    parser=argparse.ArgumentParser(prog='humboldt-protect',description='Protecao e backup central do Valdecir')
+    sub=parser.add_subparsers(dest='command',required=True)
+    for name in ['list','check','config','backup-plan','backup-now','server-backup-plan','server-backup-now','archives']:
+        sub.add_parser(name)
+    p=sub.add_parser('archive-delete'); p.add_argument('which',choices=['files','server']); p.add_argument('archive')
+    p=sub.add_parser('protect'); p.add_argument('share'); p.add_argument('value',choices=['on','off'])
+    p=sub.add_parser('backup'); p.add_argument('share'); p.add_argument('value',choices=['on','off'])
+    p=sub.add_parser('server-backup'); p.add_argument('value',choices=['on','off'])
+    args=parser.parse_args(); cfg=load_config()
+    if args.command=='list': cmd_list(cfg)
+    elif args.command=='check': cmd_check(cfg)
+    elif args.command=='config': cmd_config(cfg)
+    elif args.command=='backup-plan': cmd_backup_plan(cfg)
+    elif args.command=='backup-now': run_with_backup_lock('files',cmd_backup_now,cfg)
+    elif args.command=='server-backup-plan': cmd_server_backup_plan(cfg)
+    elif args.command=='server-backup-now': run_with_backup_lock('server',cmd_server_backup_now,cfg)
+    elif args.command=='archives': cmd_archives(cfg)
+    elif args.command=='archive-delete': run_with_backup_lock(f'archive-delete-{args.which}',lambda c: cmd_archive_delete(c,args.which,args.archive),cfg)
+    elif args.command=='protect': set_share(cfg,args.share,'protect',args.value)
+    elif args.command=='backup': set_share(cfg,args.share,'backup',args.value)
+    elif args.command=='server-backup': cmd_server_backup(cfg,args.value)
+
+if __name__=='__main__': main()
