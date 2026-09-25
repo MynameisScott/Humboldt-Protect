@@ -123,13 +123,13 @@ def contain(user, ip, share, unique_files, writes, rendel, total):
     print(f'Eventos totais    : {total}\n')
     subprocess.run(['logger','-p','local0.crit','-t','humboldt-protect',
                     f'ALERTA user={user} ip={ip} share={share} files={unique_files} writes={writes} rendel={rendel} total={total}'],check=False)
-    print('Aplicando quarentena SMB temporaria...')
+    print('Aplicando quarentena SMB permanente...')
     try:
         helper_env=os.environ.copy()
         containment_cfg=CFG.get('containment', {})
         helper_env['HUMBOLDT_CLIENT_NETWORK']=str(containment_cfg.get('client_network','192.168.150.0/24'))
         helper_env['HUMBOLDT_SERVER_IP']=str(containment_cfg.get('server_ip','192.168.150.9'))
-        helper_env['HUMBOLDT_BLOCK_TIMEOUT']=str(containment_cfg.get('block_timeout','5m'))
+        helper_env['HUMBOLDT_QUARANTINE_GROUP']=str(containment_cfg.get('quarantine_group','humboldt_quarantine'))
         result=subprocess.run([HELPER,user,ip],capture_output=True,text=True,timeout=10,env=helper_env)
         print(f'Helper exit code  : {result.returncode}')
         if result.stdout.strip(): print(result.stdout.strip())
@@ -137,7 +137,7 @@ def contain(user, ip, share, unique_files, writes, rendel, total):
         if result.returncode == 0:
             print('CONTENCAO: APLICADA')
             dash_notify('red','Ransomware detectado - contencao aplicada',
-                        f'Usuario: {user} | IP: {ip} | Share: {share} | Arquivos: {unique_files} | Writes: {writes} | Rename/Delete: {rendel} | Eventos: {total} | Bloqueio SMB temporario aplicado.',
+                        f'Usuario: {user} | IP: {ip} | Share: {share} | Arquivos: {unique_files} | Writes: {writes} | Rename/Delete: {rendel} | Eventos: {total} | Quarentena SMB permanente aplicada (IP + usuario); liberacao manual necessaria.',
                         f'ransomware-{ip}-{int(now_wall)}')
         else:
             print('CONTENCAO: FALHOU')

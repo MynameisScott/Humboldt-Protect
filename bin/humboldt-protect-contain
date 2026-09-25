@@ -1,65 +1,30 @@
 #!/bin/bash
-set -eu
+set -u
 
-NFT=/usr/sbin/nft
-SMBCONTROL=/usr/bin/smbcontrol
 LOGGER=/usr/bin/logger
-
-NFT_TABLE='ransomware_guard'
-NFT_SET='blocked_ipv4'
-BLOCK_TIMEOUT="${HUMBOLDT_BLOCK_TIMEOUT:-5m}"
-CLIENT_NETWORK="${HUMBOLDT_CLIENT_NETWORK:-192.168.150.0/24}"
-SERVER_IP="${HUMBOLDT_SERVER_IP:-192.168.150.9}"
+HELPER=/usr/local/sbin/humboldt-protect-quarantine
 
 USER_ARG="${1:-}"
 IP_ARG="${2:-}"
 
 if [ -z "$USER_ARG" ] || [ -z "$IP_ARG" ]; then
-    $LOGGER -p local0.err -t humboldt-protect "CONTENCAO NEGADA parametros-invalidos"
-    exit 2
-fi
-
-if ! /usr/bin/python3 - "$IP_ARG" "$CLIENT_NETWORK" "$SERVER_IP" <<'PYEOF'
-import ipaddress, sys
-try:
-    ip = ipaddress.ip_address(sys.argv[1])
-    rede = ipaddress.ip_network(sys.argv[2], strict=False)
-    servidor = ipaddress.ip_address(sys.argv[3])
-except ValueError:
-    sys.exit(1)
-if ip.version != 4 or ip not in rede or ip == servidor:
-    sys.exit(1)
-PYEOF
-then
-    $LOGGER -p local0.warning -t humboldt-protect \
-        "CONTENCAO NEGADA user=$USER_ARG ip=$IP_ARG motivo=ip-nao-permitido"
-    exit 2
-fi
-
-if ! $NFT list set inet "$NFT_TABLE" "$NFT_SET" >/dev/null 2>&1; then
     $LOGGER -p local0.err -t humboldt-protect \
-        "CONTENCAO FALHOU user=$USER_ARG ip=$IP_ARG motivo=nft-set-ausente"
-    exit 3
+        "CONTENCAO NEGADA parametros-invalidos"
+    exit 2
 fi
 
 $LOGGER -p local0.crit -t humboldt-protect \
-    "CONTENCAO INICIADA user=$USER_ARG ip=$IP_ARG timeout=$BLOCK_TIMEOUT"
+    "CONTENCAO INICIADA user=$USER_ARG ip=$IP_ARG modo=quarentena-permanente"
 
-if ! $NFT add element inet "$NFT_TABLE" "$NFT_SET" \
-    "{ $IP_ARG timeout $BLOCK_TIMEOUT }" 2>/dev/null
-then
-    if ! $NFT list set inet "$NFT_TABLE" "$NFT_SET" | grep -Fq "$IP_ARG"; then
-        $LOGGER -p local0.err -t humboldt-protect \
-            "CONTENCAO FALHOU user=$USER_ARG ip=$IP_ARG motivo=nft-add"
-        exit 4
-    fi
+if "$HELPER" block "$USER_ARG" "$IP_ARG"; then
+    $LOGGER -p local0.crit -t humboldt-protect \
+        "CONTENCAO APLICADA user=$USER_ARG ip=$IP_ARG modo=quarentena-permanente"
+    exit 0
 fi
 
-if ! $SMBCONTROL smbd kill-client-ip "$IP_ARG"; then
-    $LOGGER -p local0.warning -t humboldt-protect \
-        "SESSAO SMB NAO ENCONTRADA user=$USER_ARG ip=$IP_ARG"
-fi
+RC=$?
 
-$LOGGER -p local0.crit -t humboldt-protect \
-    "CONTENCAO APLICADA user=$USER_ARG ip=$IP_ARG timeout=$BLOCK_TIMEOUT"
-exit 0
+$LOGGER -p local0.err -t humboldt-protect \
+    "CONTENCAO FALHOU user=$USER_ARG ip=$IP_ARG rc=$RC"
+
+exit "$RC"

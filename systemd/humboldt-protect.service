@@ -1,6 +1,6 @@
 [Unit]
 Description=Humboldt Protect - SMB Ransomware Protection
-After=network-online.target ufw.service smbd.service
+After=network-online.target ufw.service smbd.service winbind.service
 Wants=network-online.target
 
 [Service]

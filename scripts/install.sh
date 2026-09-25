@@ -11,7 +11,9 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 install -d -m 700 /etc/humboldt-protect
 install -d -m 700 /var/lib/humboldt-protect
 
-for f in humboldt-protect humboldt-protect-watch humboldt-protect-contain humboldt-protect-nft-init humboldt-dash-notify; do
+getent group humboldt_quarantine >/dev/null 2>&1 || groupadd --system humboldt_quarantine
+
+for f in humboldt-protect humboldt-protect-watch humboldt-protect-contain humboldt-protect-quarantine humboldt-protect-nft-init humboldt-dash-notify; do
   install -o root -g root -m 750 "$ROOT_DIR/bin/$f" "/usr/local/sbin/$f"
 done
 
@@ -33,6 +35,6 @@ echo
 echo "Instalacao-base concluida."
 echo "1) Edite /etc/humboldt-protect/config.json"
 echo "2) Crie /etc/humboldt-protect/borg.passphrase com chmod 600"
-echo "3) Configure Samba full_audit conforme docs/SAMBA_AUDIT.md"
+echo "3) Configure Samba full_audit e invalid users conforme docs/SAMBA_AUDIT.md"
 echo "4) Valide: sudo humboldt-protect check"
 echo "5) Inicie: sudo systemctl enable --now humboldt-protect.service"

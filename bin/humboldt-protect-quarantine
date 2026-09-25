@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+
+import datetime
+import grp
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+
+STATE_DIR = "/var/lib/humboldt-protect"
+STATE_FILE = os.path.join(STATE_DIR, "quarantine.json")
+
+GROUP = os.environ.get("HUMBOLDT_QUARANTINE_GROUP", "humboldt_quarantine")
+CLIENT_NETWORK = os.environ.get("HUMBOLDT_CLIENT_NETWORK", "192.168.150.0/24")
+SERVER_IP = os.environ.get("HUMBOLDT_SERVER_IP", "192.168.150.9")
+
+NFT = "/usr/sbin/nft"
+NFT_TABLE = "ransomware_guard"
+NFT_SET = "blocked_ipv4"
+
+SMBSTATUS = "/usr/bin/smbstatus"
+SMBCONTROL = "/usr/bin/smbcontrol"
+GPASSWD = "/usr/bin/gpasswd"
+LOGGER = "/usr/bin/logger"
+
+
+def fail(msg, code=1):
+    print(f"ERRO: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        fail("execute com sudo.")
+
+
+def log(priority, message):
+    subprocess.run(
+        [LOGGER, "-p", priority, "-t", "humboldt-protect", message],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def normalize_user(value):
+    value = value.strip()
+
+    if "\\" in value:
+        value = value.rsplit("\\", 1)[1]
+
+    if "@" in value:
+        value = value.split("@", 1)[0]
+
+    return value
+
+
+def load_state():
+    if not os.path.isfile(STATE_FILE):
+        return {"version": 1, "blocks": []}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data.get("blocks"), list):
+            raise ValueError("blocks invalido")
+
+        return data
+
+    except Exception as exc:
+        fail(f"estado de quarentena invalido: {exc}")
+
+
+def save_state(data):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(
+        prefix=".quarantine.",
+        suffix=".tmp",
+        dir=STATE_DIR,
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.chmod(tmp, 0o600)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, STATE_FILE)
+
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def ensure_group():
+    result = subprocess.run(
+        ["getent", "group", GROUP],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if result.returncode != 0:
+        subprocess.run(
+            ["groupadd", "--system", GROUP],
+            check=True,
+        )
+
+
+def user_exists(user):
+    return subprocess.run(
+        ["id", user],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def group_members():
+    try:
+        return set(grp.getgrnam(GROUP).gr_mem)
+    except KeyError:
+        return set()
+
+
+def ensure_user_blocked(user):
+    ensure_group()
+
+    if not user_exists(user):
+        return False, "usuario-nao-resolvido"
+
+    if user in group_members():
+        return True, "ja-bloqueado"
+
+    result = subprocess.run(
+        [GPASSWD, "-a", user, GROUP],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        return False, result.stdout.strip()
+
+    return True, "bloqueado"
+
+
+def remove_user_block(user):
+    if user not in group_members():
+        return True
+
+    result = subprocess.run(
+        [GPASSWD, "-d", user, GROUP],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    return result.returncode == 0
+
+
+def nft_statement(statement):
+    return subprocess.run(
+        [NFT, "-f", "-"],
+        input=statement + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def nft_set_text():
+    result = subprocess.run(
+        [NFT, "list", "set", "inet", NFT_TABLE, NFT_SET],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    return result.stdout if result.returncode == 0 else ""
+
+
+def ip_is_blocked(ip):
+    pattern = r"(?<![0-9.])" + re.escape(ip) + r"(?![0-9.])"
+    return re.search(pattern, nft_set_text()) is not None
+
+
+def ensure_ip_blocked(ip):
+    if ip_is_blocked(ip):
+        return True
+
+    result = nft_statement(
+        f"add element inet {NFT_TABLE} {NFT_SET} {{ {ip} }}"
+    )
+
+    return result.returncode == 0 or ip_is_blocked(ip)
+
+
+def remove_ip_block(ip):
+    if not ip_is_blocked(ip):
+        return True
+
+    result = nft_statement(
+        f"delete element inet {NFT_TABLE} {NFT_SET} {{ {ip} }}"
+    )
+
+    return result.returncode == 0
+
+
+def validate_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        network = ipaddress.ip_network(CLIENT_NETWORK, strict=False)
+        server_ip = ipaddress.ip_address(SERVER_IP)
+    except ValueError as exc:
+        fail(f"configuracao/IP invalido: {exc}", 2)
+
+    if ip.version != 4 or ip not in network or ip == server_ip:
+        fail(f"IP nao permitido para quarentena: {value}", 2)
+
+    return str(ip)
+
+
+def session_ips_for_user(user):
+    result = subprocess.run(
+        [SMBSTATUS, "-b"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    ips = set()
+
+    for line in result.stdout.splitlines():
+        fields = line.split()
+
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+
+        smb_user = normalize_user(fields[1])
+
+        if smb_user.lower() != user.lower():
+            continue
+
+        match = re.search(
+            r"ipv4:(\d{1,3}(?:\.\d{1,3}){3}):",
+            line,
+        )
+
+        if match:
+            ips.add(match.group(1))
+
+    return ips
+
+
+def kill_ip(ip):
+    subprocess.run(
+        [SMBCONTROL, "smbd", "kill-client-ip", ip],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def block(user_arg, ip_arg):
+    user = normalize_user(user_arg)
+    ip = validate_ip(ip_arg)
+
+    state = load_state()
+
+    existing = next(
+        (
+            item for item in state["blocks"]
+            if item.get("user", "").lower() == user.lower()
+            and item.get("ip") == ip
+        ),
+        None,
+    )
+
+    if existing:
+        block_id = existing["id"]
+
+    else:
+        now = datetime.datetime.now().astimezone()
+
+        block_id = (
+            "Q-"
+            + now.strftime("%Y%m%d-%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:6]
+        )
+
+        state["blocks"].append({
+            "id": block_id,
+            "user": user,
+            "ip": ip,
+            "created_at": now.isoformat(timespec="seconds"),
+        })
+
+        save_state(state)
+
+    user_ok, user_result = ensure_user_blocked(user)
+    ip_ok = ensure_ip_blocked(ip)
+
+    session_ips = session_ips_for_user(user)
+    session_ips.add(ip)
+
+    for session_ip in session_ips:
+        kill_ip(session_ip)
+
+    if user_ok and ip_ok:
+        log(
+            "local0.crit",
+            f"QUARENTENA APLICADA id={block_id} user={user} ip={ip}",
+        )
+
+        print("QUARENTENA APLICADA")
+        print(f"ID      : {block_id}")
+        print(f"Usuario : {user}")
+        print(f"IP      : {ip}")
+        print("Usuario : BLOQUEADO")
+        print("IP      : BLOQUEADO")
+        return 0
+
+    log(
+        "local0.err",
+        f"QUARENTENA PARCIAL id={block_id} user={user} ip={ip} "
+        f"user_ok={user_ok} ip_ok={ip_ok} detalhe={user_result}",
+    )
+
+    print("QUARENTENA PARCIAL")
+    print(f"ID      : {block_id}")
+    print(f"Usuario : {'OK' if user_ok else 'FALHA'}")
+    print(f"IP      : {'OK' if ip_ok else 'FALHA'}")
+
+    return 4
+
+
+def list_blocks():
+    state = load_state()
+    blocks = state["blocks"]
+
+    print()
+    print("HUMBOLDT PROTECT - QUARENTENAS")
+    print("=" * 92)
+
+    if not blocks:
+        print("Nenhuma quarentena registrada.")
+    else:
+        print(
+            f"{'ID':<27} "
+            f"{'USUARIO':<24} "
+            f"{'IP':<17} "
+            f"DESDE"
+        )
+        print("-" * 92)
+
+        for item in blocks:
+            print(
+                f"{item.get('id',''):<27} "
+                f"{item.get('user',''):<24} "
+                f"{item.get('ip',''):<17} "
+                f"{item.get('created_at','')}"
+            )
+
+    print()
+    print("Usuarios no grupo de quarentena:")
+
+    members = sorted(group_members())
+
+    if members:
+        for user in members:
+            print(f"  - {user}")
+    else:
+        print("  nenhum")
+
+    print()
+    print("NFT:")
+    text = nft_set_text().strip()
+
+    if text:
+        print(text)
+    else:
+        print("  conjunto indisponivel")
+
+
+def release(new_blocks, old_blocks):
+    new_users = {
+        x["user"].lower()
+        for x in new_blocks
+    }
+
+    old_users = {
+        x["user"].lower(): x["user"]
+        for x in old_blocks
+    }
+
+    new_ips = {x["ip"] for x in new_blocks}
+    old_ips = {x["ip"] for x in old_blocks}
+
+    for lower_user, original_user in old_users.items():
+        if lower_user not in new_users:
+            if not remove_user_block(original_user):
+                fail(
+                    f"nao foi possivel liberar usuario {original_user}"
+                )
+
+    for ip in old_ips:
+        if ip not in new_ips:
+            if not remove_ip_block(ip):
+                fail(f"nao foi possivel liberar IP {ip}")
+
+    state = {
+        "version": 1,
+        "blocks": new_blocks,
+    }
+
+    save_state(state)
+
+
+def unblock_id(block_id):
+    state = load_state()
+    old = state["blocks"]
+
+    new = [
+        x for x in old
+        if x.get("id") != block_id
+    ]
+
+    if len(new) == len(old):
+        fail(f"quarentena nao encontrada: {block_id}")
+
+    release(new, old)
+
+    log(
+        "local0.notice",
+        f"QUARENTENA LIBERADA id={block_id}",
+    )
+
+    print(f"QUARENTENA LIBERADA: {block_id}")
+
+
+def unblock_user(user_arg):
+    user = normalize_user(user_arg)
+
+    state = load_state()
+    old = state["blocks"]
+
+    new = [
+        x for x in old
+        if x.get("user", "").lower() != user.lower()
+    ]
+
+    if len(new) == len(old):
+        if user in group_members():
+            if not remove_user_block(user):
+                fail(f"nao foi possivel liberar usuario {user}")
+
+            print(f"USUARIO LIBERADO: {user}")
+            return
+
+        fail(f"usuario nao esta em quarentena: {user}")
+
+    release(new, old)
+    print(f"USUARIO LIBERADO: {user}")
+
+
+def unblock_ip(ip_arg):
+    ip = validate_ip(ip_arg)
+
+    state = load_state()
+    old = state["blocks"]
+
+    new = [
+        x for x in old
+        if x.get("ip") != ip
+    ]
+
+    if len(new) == len(old):
+        if ip_is_blocked(ip):
+            if not remove_ip_block(ip):
+                fail(f"nao foi possivel liberar IP {ip}")
+
+            print(f"IP LIBERADO: {ip}")
+            return
+
+        fail(f"IP nao esta em quarentena: {ip}")
+
+    release(new, old)
+    print(f"IP LIBERADO: {ip}")
+
+
+def restore():
+    state = load_state()
+
+    ensure_group()
+
+    errors = 0
+
+    for user in sorted({
+        x["user"]
+        for x in state["blocks"]
+    }):
+        ok, _ = ensure_user_blocked(user)
+
+        if not ok:
+            errors += 1
+            log(
+                "local0.err",
+                f"RESTAURACAO QUARENTENA usuario-falhou user={user}",
+            )
+
+    for ip in sorted({
+        x["ip"]
+        for x in state["blocks"]
+    }):
+        if not ensure_ip_blocked(ip):
+            errors += 1
+            log(
+                "local0.err",
+                f"RESTAURACAO QUARENTENA ip-falhou ip={ip}",
+            )
+
+    if errors:
+        fail(
+            f"restauracao da quarentena terminou com {errors} erro(s)",
+            5,
+        )
+
+
+def main():
+    require_root()
+
+    if len(sys.argv) < 2:
+        fail(
+            "uso: humboldt-protect-quarantine "
+            "{block|list|unblock|unblock-user|unblock-ip|restore}"
+        )
+
+    command = sys.argv[1]
+
+    if command == "block" and len(sys.argv) == 4:
+        sys.exit(block(sys.argv[2], sys.argv[3]))
+
+    elif command == "list" and len(sys.argv) == 2:
+        list_blocks()
+
+    elif command == "unblock" and len(sys.argv) == 3:
+        unblock_id(sys.argv[2])
+
+    elif command == "unblock-user" and len(sys.argv) == 3:
+        unblock_user(sys.argv[2])
+
+    elif command == "unblock-ip" and len(sys.argv) == 3:
+        unblock_ip(sys.argv[2])
+
+    elif command == "restore" and len(sys.argv) == 2:
+        restore()
+
+    else:
+        fail("parametros invalidos.", 2)
+
+
+if __name__ == "__main__":
+    main()

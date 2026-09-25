@@ -1,12 +1,36 @@
 {
-  "version": 1,
+  "version": 2,
   "shares": {
-    "Biblioteca": {"path": "/srv/SEU_VOLUME/Biblioteca", "protect": true, "backup": true},
-    "Ti":         {"path": "/srv/SEU_VOLUME/Ti",         "protect": true, "backup": true},
-    "Fileserver": {"path": "/srv/SEU_VOLUME/Fileserver", "protect": true, "backup": true},
-    "Imagens":    {"path": "/srv/SEU_VOLUME/Imagens",    "protect": true, "backup": true},
-    "Scanner":    {"path": "/srv/SEU_VOLUME/Scanner",    "protect": true, "backup": true},
-    "Studio":     {"path": "/srv/SEU_VOLUME/Studio",     "protect": true, "backup": true}
+    "Biblioteca": {
+      "path": "/srv/SEU_VOLUME/Biblioteca",
+      "protect": true,
+      "backup": true
+    },
+    "Ti": {
+      "path": "/srv/SEU_VOLUME/Ti",
+      "protect": true,
+      "backup": true
+    },
+    "Fileserver": {
+      "path": "/srv/SEU_VOLUME/Fileserver",
+      "protect": true,
+      "backup": true
+    },
+    "Imagens": {
+      "path": "/srv/SEU_VOLUME/Imagens",
+      "protect": true,
+      "backup": true
+    },
+    "Scanner": {
+      "path": "/srv/SEU_VOLUME/Scanner",
+      "protect": true,
+      "backup": true
+    },
+    "Studio": {
+      "path": "/srv/SEU_VOLUME/Studio",
+      "protect": true,
+      "backup": true
+    }
   },
   "server_backup": true,
   "server_paths": [
@@ -14,6 +38,7 @@
     "/usr/local/sbin/humboldt-protect",
     "/usr/local/sbin/humboldt-protect-watch",
     "/usr/local/sbin/humboldt-protect-contain",
+    "/usr/local/sbin/humboldt-protect-quarantine",
     "/usr/local/sbin/humboldt-protect-nft-init",
     "/usr/local/sbin/humboldt-dash-notify",
     "/var/lib/humboldt-protect"
@@ -44,6 +69,6 @@
   "containment": {
     "client_network": "192.168.150.0/24",
     "server_ip": "192.168.150.9",
-    "block_timeout": "5m"
+    "quarantine_group": "humboldt_quarantine"
   }
 }

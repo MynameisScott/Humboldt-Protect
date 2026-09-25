@@ -12,6 +12,7 @@ import tempfile
 
 CONFIG = Path('/etc/humboldt-protect/config.json')
 BACKUP_LOCK = '/run/humboldt-protect-backup.lock'
+QUARANTINE_HELPER = '/usr/local/sbin/humboldt-protect-quarantine'
 
 
 def fail(message, rc=1):
@@ -297,18 +298,33 @@ def cmd_check(cfg):
 def cmd_config(cfg): print(json.dumps(cfg,ensure_ascii=False,indent=2))
 
 
+
+def run_quarantine(arguments):
+    if not os.path.isfile(QUARANTINE_HELPER):
+        fail(f'gerenciador de quarentena nao encontrado: {QUARANTINE_HELPER}', 2)
+    if not os.access(QUARANTINE_HELPER, os.X_OK):
+        fail(f'gerenciador de quarentena nao e executavel: {QUARANTINE_HELPER}', 2)
+    return subprocess.run([QUARANTINE_HELPER] + arguments).returncode
+
 def main():
     require_root()
     parser=argparse.ArgumentParser(prog='humboldt-protect',description='Protecao e backup central do Valdecir')
     sub=parser.add_subparsers(dest='command',required=True)
-    for name in ['list','check','config','backup-plan','backup-now','server-backup-plan','server-backup-now','archives']:
+    for name in ['list','check','config','backup-plan','backup-now','server-backup-plan','server-backup-now','archives','blocked']:
         sub.add_parser(name)
+    p=sub.add_parser('unblock'); p.add_argument('id')
+    p=sub.add_parser('unblock-user'); p.add_argument('user')
+    p=sub.add_parser('unblock-ip'); p.add_argument('ip')
     p=sub.add_parser('archive-delete'); p.add_argument('which',choices=['files','server']); p.add_argument('archive')
     p=sub.add_parser('protect'); p.add_argument('share'); p.add_argument('value',choices=['on','off'])
     p=sub.add_parser('backup'); p.add_argument('share'); p.add_argument('value',choices=['on','off'])
     p=sub.add_parser('server-backup'); p.add_argument('value',choices=['on','off'])
     args=parser.parse_args(); cfg=load_config()
-    if args.command=='list': cmd_list(cfg)
+    if args.command=='blocked': raise SystemExit(run_quarantine(['list']))
+    elif args.command=='unblock': raise SystemExit(run_quarantine(['unblock',args.id]))
+    elif args.command=='unblock-user': raise SystemExit(run_quarantine(['unblock-user',args.user]))
+    elif args.command=='unblock-ip': raise SystemExit(run_quarantine(['unblock-ip',args.ip]))
+    elif args.command=='list': cmd_list(cfg)
     elif args.command=='check': cmd_check(cfg)
     elif args.command=='config': cmd_config(cfg)
     elif args.command=='backup-plan': cmd_backup_plan(cfg)
