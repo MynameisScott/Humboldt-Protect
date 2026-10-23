@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-23 - manutencao ClamAV e AppArmor (sem alteracao no Humboldt Protect)
+
+- No servidor Valdecir (Debian 12 / OpenMediaVault), os pacotes `libclamav12`, `clamdscan`, `clamav-daemon`, `clamav-base` e `clamav-freshclam` foram atualizados da versao `1.4.3+dfsg-1~deb12u2` para `1.4.6+dfsg-0+deb12u1`.
+- Foram preservados o `freshclam.conf`, as personalizacoes do perfil AppArmor do `clamd` e as configuracoes locais dos servicos systemd.
+- Ao perfil `/etc/apparmor.d/usr.sbin.clamd` foram acrescentadas somente as permissoes de leitura `@{PROC}/[0-9]*/mountinfo r,` e `/sys/fs/cgroup/system.slice/cpu.max r,`.
+- O perfil foi validado com `apparmor_parser -Q -T` e recarregado com `apparmor_parser -r -T`, ambos sem erros.
+- Confirmados `clamav-daemon` e `clamav-freshclam` ativos, bases `daily.cld`, `main.cvd` e `bytecode.cvd` atualizadas, e perfis do ClamAV em modo `enforce`.
+- A verificacao de 10 minutos dos logs do kernel nao encontrou novas negativas `apparmor="DENIED"` relativas a `clamd` ou `freshclam`.
+- Backup do perfil anterior preservado em `/root/apparmor-backups/usr.sbin.clamd.bak-20261023`, sob diretorio com permissao `700`.
+- Nao houve reboot nem alteracao no Samba, nas politicas do OMV, nos agendamentos de varredura ou no codigo/servicos do Humboldt Protect. Esta entrada documenta manutencao do ambiente, nao uma nova funcionalidade do projeto.
+- Pendencias de acompanhamento: auditar rotinas e cobertura de varredura, exclusoes, resposta a deteccoes e perfis Samba ainda em `complain`. Nao foram executadas nesta manutencao.
+
 ## 2026-09-25 - quarentena persistente por IP + usuario
 
 - Contencao deixou de expirar automaticamente.
