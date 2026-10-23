@@ -47,3 +47,25 @@ No ambiente de origem, alertas vermelhos no Dash tambem geram e-mail. O e-mail e
 ## Backups
 
 RAID nao substitui backup. Retencao Borg ajuda na recuperacao historica, mas ambientes criticos devem considerar copias offline/imutaveis e testes periodicos de restauracao.
+
+## Camada complementar: ClamAV e AppArmor no Valdecir
+
+**Referencia da manutencao: 23/10/2026.** O ClamAV complementa a deteccao comportamental do Humboldt Protect, mas **nao a substitui**. A atualizacao do antivirus nao alterou as regras de quarentena por usuario/IP, o `full_audit` ou os backups Borg.
+
+- ClamAV atualizado para `1.4.6+dfsg-0+deb12u1`; `clamav-daemon` e `clamav-freshclam` foram encontrados ativos ao final da manutencao.
+- Na verificacao registrada, as bases `daily.cld`, `main.cvd` e `bytecode.cvd` estavam atualizadas.
+- Os perfis AppArmor de `/usr/sbin/clamd` e `/usr/bin/freshclam` estavam carregados em modo `enforce`.
+- O perfil local do `clamd` foi preservado. Foram adicionadas somente as regras de leitura abaixo, disponibilizadas na versao do pacote Debian:
+
+```text
+@{PROC}/[0-9]*/mountinfo r,
+/sys/fs/cgroup/system.slice/cpu.max r,
+```
+
+- A inclusao personalizada `include <local/usr.sbin.clamd>` foi mantida. O perfil passou pela validacao sintatica e foi recarregado sem erros.
+- O perfil anterior foi preservado **somente no servidor** em `/root/apparmor-backups/usr.sbin.clamd.bak-20261023`; nao versionar esse arquivo real no Git.
+- Alguns perfis associados ao Samba permaneciam em modo `complain`. Nao foram alterados nesta manutencao; revisar impactos antes de qualquer migracao para `enforce`.
+
+**Limite das evidencias:** servicos ativos e assinaturas atualizadas **nao comprovam**, por si so, varredura automatica, cobertura de todas as shares, quarentena de arquivos infectados ou capacidade de resposta em tempo real. Esses itens ainda exigem auditoria especifica. Nenhum teste EICAR nem verificacao de cobertura foi registrado nesta manutencao.
+
+Nunca coloque `clamd`, `freshclam` ou perfis Samba em modo permissivo para contornar erros sem analise e aprovacao. Preserve a configuracao local em atualizacoes e compare-a com os arquivos `.dpkg-dist` quando disponiveis.
